@@ -34,8 +34,9 @@ class InputState:
     move_x / move_y: -1.0 .. 1.0 arasi analog eksen degeri.
         Klavyede yalnizca -1 / 0 / 1 uretilir; analog joystickte ara
         degerler de gelir. Bu sayede imza her iki kaynak icin de aynidir.
-    fire: o an ates istegi var mi (bool). Cooldown mantigi Ship icinde;
-        burada yalnizca 'niyet' tasinir.
+    fire: o an buton basili mi (bool). Ates OTOMATIK oldugundan bu alan
+        ozel guc tetikleyicisi olarak kullanilir; burada yalnizca 'niyet'
+        tasinir.
     """
     move_x: float = 0.0
     move_y: float = 0.0
@@ -68,8 +69,9 @@ class InputSource(ABC):
 class KeyboardInputSource(InputSource):
     """Klavye girisini iki oyuncunun InputState'ine cevirir.
 
-    Oyuncu 1 (sol): W/A/S/D hareket, SPACE ates.
-    Oyuncu 2 (sag): ok tuslari hareket, ENTER (K_RETURN ve K_KP_ENTER) ates.
+    Ates OTOMATIK; SPACE/ENTER ozel guc tetikler (InputState.fire'a maplenir).
+    Oyuncu 1 (sol): W/A/S/D hareket, SPACE ozel guc.
+    Oyuncu 2 (sag): ok tuslari hareket, ENTER (K_RETURN ve K_KP_ENTER) ozel guc.
     """
 
     def poll(self, events: list, keys) -> dict:
@@ -173,7 +175,7 @@ class SerialJoystickInputSource(InputSource):
 
         Merkez = ADC_MAX/2 -> 0.0. ADC_MAX != 0 settings'te garanti edilir.
         invert=True ise eksen yonu ters cevrilir (joystick fiziksel montaji
-        ekran yonuyle ters ise; settings.JOY_INVERT_X/Y ile kontrol edilir).
+        ekran yonuyle ters ise; settings.P1/P2_INVERT_X/Y ile kontrol edilir).
         """
         # 0..ADC_MAX -> -1..1
         value = (raw / settings.ADC_MAX) * 2.0 - 1.0
@@ -198,9 +200,11 @@ class SerialJoystickInputSource(InputSource):
         except ValueError:
             return self._last
 
-        ix, iy = settings.JOY_INVERT_X, settings.JOY_INVERT_Y
-        p1 = InputState(self._map_axis(x1, ix), self._map_axis(y1, iy), b1 > 0.5)
-        p2 = InputState(self._map_axis(x2, ix), self._map_axis(y2, iy), b2 > 0.5)
+        # Invert ayari OYUNCU BASINA ayri (iki joystick farkli monte edilmis).
+        p1 = InputState(self._map_axis(x1, settings.P1_INVERT_X),
+                        self._map_axis(y1, settings.P1_INVERT_Y), b1 > 0.5)
+        p2 = InputState(self._map_axis(x2, settings.P2_INVERT_X),
+                        self._map_axis(y2, settings.P2_INVERT_Y), b2 > 0.5)
         return {1: p1, 2: p2}
 
     def poll(self, events: list, keys) -> dict:
@@ -250,7 +254,7 @@ class ScriptedInputSource(InputSource):
         p1 = InputState(
             move_x=math.sin(t) * self._rng.uniform(0.4, 1.0),
             move_y=math.cos(t * 0.7) * self._rng.uniform(0.2, 0.8),
-            fire=(self._frame % 6 == 0),   # periyodik ates
+            fire=(self._frame % 6 == 0),   # periyodik buton (ozel guc niyeti)
         )
         p2 = InputState(
             move_x=math.cos(t * 1.3) * self._rng.uniform(0.4, 1.0),

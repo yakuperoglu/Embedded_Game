@@ -9,7 +9,7 @@
  *     x1,y1,b1,x2,y2,b2\n
  *
  *   x,y : 0..4095 ham ADC degeri (12-bit). Oyun bunu -1..1'e cevirir.
- *   b   : 1 = buton basili (ATES), 0 = basili degil.
+ *   b   : 1 = buton basili (OZEL GUC), 0 = basili degil.
  *
  * Baud: 115200  (settings.SERIAL_BAUD ile AYNI olmali)
  *
@@ -55,7 +55,7 @@ void loop() {
   int x2 = analogRead(P2_X);
   int y2 = analogRead(P2_Y);
 
-  // --- Butonlar: bu modulde BASILINCA HIGH. Oyun b=1'i "ates" bekler. ---
+  // --- Butonlar: bu modulde BASILINCA HIGH. Oyun b=1'i ozel guc tetikleyicisi olarak kullanir. ---
   int b1 = (digitalRead(P1_SW) == HIGH) ? 1 : 0;
   int b2 = (digitalRead(P2_SW) == HIGH) ? 1 : 0;
 

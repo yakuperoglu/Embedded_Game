@@ -1,9 +1,11 @@
 # Split-Screen Uzay Atari (2 Oyunculu)
 
 Universite gomulu sistem projesi. Tek ekranda, dikey bir cizgiyle ikiye
-bolunmus (split-screen), 2 oyunculu bir uzay atari oyunu. Tum grafikler
-`pygame.draw` primitifleriyle cizilir; disaridan **hicbir resim/ses dosyasi
-kullanilmaz**.
+bolunmus (split-screen), 2 oyunculu bir uzay atari oyunu. Oyuncu gemileri
+`assets/ship_p1.png` / `assets/ship_p2.png` sprite'lariyla cizilir (Aseprite'tan
+uretildi); meteor/mermi/rakip/efektler `pygame.draw` primitifleriyle cizilir.
+Sprite dosyalari yoksa gemiler otomatik olarak ucgen govdeye duser (oyun yine
+calisir). Ses dosyasi kullanilmaz.
 
 Hedef platform: **Windows, Python 3.10.7, pygame 2.5.2**.
 
@@ -29,9 +31,11 @@ Proje kokunden:
 python main.py
 ```
 
-Oyun **tam ekran** acilir. Cozunurluk monitorden otomatik alinir
-(`pygame.display.Info()`); konumlar hicbir zaman sabit piksel olarak
-hardcode edilmez, hep guncel genislik/yukseklikten hesaplanir.
+Oyun **tam ekran** acilir: surec Windows'ta DPI-aware yapilir ve ekran
+masaustu (fiziksel) cozunurluginde `set_mode((0,0), FULLSCREEN)` ile acilir,
+boylece ekrani TAM kaplar (ekran olcekleme/DPI scaling yuzunden sag/alt
+bosluk olmaz). Konumlar sabit piksel hardcode edilmez; her sey guncel
+genislik/yukseklikten ve `SCALE = yukseklik/1080`'den hesaplanir.
 
 ### Headless dogrulama (selftest)
 
@@ -85,19 +89,39 @@ ileride analog joystick birebir uyumlu calisir.
   HUD'da ortada bir **SEVIYE** gostergesi bulunur.
 - **Ates (OTOMATIK)**: arac yukari mermiyi kendiliginden atar (`FIRE_COOLDOWN`
   araliginda). Butona basmaya gerek yok.
-- **Ozel guc**: her **`SPECIAL_KILLS_REQUIRED`** (varsayilan 15) asteroidi
-  *mermiyle* vurunca ozel guc DOLAR (HUD'da "OZEL: n/15" + ilerleme cubugu;
+- **Rakip gemiler**: arada bir (asteroidlerden NADIR, `ENEMY_SPAWN_MIN..MAX`
+  sn) GLOBAL bir zamanlayiciyla **iki arenaya da AYNI ANDA** (adil) rakip gemi
+  dogar. Rakipler arenanin **ust bandinda** (`ENEMY_BAND_TOP..BOTTOM`) yatay
+  devriye yapar, **asagi inmez**, ve periyodik olarak (`ENEMY_FIRE_INTERVAL`)
+  hedef geminin **o anki konumuna** dogru duz giden bir **lazer** atar. Lazer
+  oyuncuya carparsa o oyuncu sabit **15 HP** (`LASER_DAMAGE`) kaybeder
+  (dokunulmazlik korunur). Rakip gemi `ENEMY_HP` mermiyle (varsayilan 3) yok
+  olur -> `ENEMY_SCORE` puan + ozel guc dolumu.
+  Arena basina en fazla `ENEMY_MAX_PER_ARENA` rakip bulunur.
+- **Ozel guc**: her **`SPECIAL_KILLS_REQUIRED`** (varsayilan 15) asteroid veya
+  rakip gemiyi *mermiyle* vurunca ozel guc DOLAR (HUD'da "OZEL: n/15" + ilerleme cubugu;
   dolunca "HAZIR!"). Buton (joystick SW / SPACE / ENTER) ile kullanildiginda
-  o oyuncunun arenasindaki **TUM meteorlar** yok olur (puan + patlama + kisa
-  ekran flashi), sayac sifirlanir. Iki oyuncunun ozel gucu birbirinden bagimsizdir.
+  o oyuncunun arenasindaki **TUM tehditler** (meteorlar + rakip gemiler + rakip
+  lazerleri) yok olur (puan + patlama + kisa ekran flashi), sayac sifirlanir.
+  Iki oyuncunun ozel gucu birbirinden bagimsizdir.
+- **Can (100 uzerinden HP)**: her oyuncu **100 can** ile baslar. Hasar
+  kaynaklari:
+  - **Meteor** (dibe ulasir veya araca carpar): **boyuta gore** hasar
+    (`METEOR_DAMAGE_SMALL/MEDIUM/LARGE` = 8/15/25).
+  - **Rakip lazeri**: **sabit 15** (`LASER_DAMAGE`).
+  - **Rakip gemiye toslama**: `ENEMY_CRASH_DAMAGE` (30).
+  - Vurus sonrasi kisa **i-frame** (`INVULN_TIME`) + yanip sonme; bu pencerede
+    ek hasar alinmaz (ust uste carpisma 'melt' yapmaz). Can **0** olunca elenir.
 - **Carpismalar**:
   - Mermi-meteor: meteor yok olur, skor artar (buyuk meteor daha cok puan),
-    patlama partikulleri cikar, ozel guc dolumu +1.
-  - Meteor arena dibine ulasirsa **veya** araca carparsa o oyuncu **1 can**
-    kaybeder (baslangic 3 can), kisa sureli dokunulmazlik + yanip sonme olur,
-    meteor kaldirilir.
-- **HUD**: P1 skor + can + ozel guc SOL UST, P2 ayni sekilde SAG UST,
-  ortada zorluk seviyesi.
+    ozel guc dolumu +1.
+  - Mermi-rakip gemi: rakip `ENEMY_HP` vurusta yok olur (skor + ozel dolum).
+  - (En kucuk asteroid, vurmasi kolaylassin diye buyutuldu.)
+- **Hasar efekti (kirmizi)**: can gidince o oyuncunun yarisinda **anlik kirmizi
+  flash** parlar; ayrica **kalici bir kirmizi tint** can azaldikca artar
+  (`HURT_*` ayarlari). Boylece dusuk canda ekran giderek kizarir (tehlike hissi).
+- **HUD**: P1 skor + can (renk: yesil>sari>kirmizi) + ozel guc SOL UST,
+  P2 ayni sekilde SAG UST, ortada zorluk seviyesi.
 - **Oyun bitisi**: bir oyuncunun cani 0 olunca o yari donar/karartilir
   ("ELENDI"). **Her iki** oyuncu da olunce tam ekran "OYUN BITTI" ekrani
   cikar: ortada kazanan (yuksek skor; esitse berabere). `R` ile yeniden,
@@ -122,10 +146,15 @@ settings.py  <-  input_source.py / entities.py  <-  main.py
   `InputSource` (ABC), `KeyboardInputSource` (su an kullanilan),
   `SerialJoystickInputSource` (gelecekteki ESP stub'i),
   `ScriptedInputSource` (selftest).
-- **entities.py**: `Ship`, `Bullet`, `Meteor`, `Particle` -> hepsi dt tabanli,
-  pygame primitifleriyle cizilir.
+- **entities.py**: `Ship`, `Bullet`, `Meteor`, `Enemy`, `EnemyLaser`,
+  `Particle` -> hepsi dt tabanli. Gemi sprite'i `get_ship_image()` ile
+  `assets/`'ten yuklenir (yoksa ucgen fallback), gerisi pygame primitifi.
 - **main.py**: giris noktasi, `Game` (durum makinesi: PLAYING/PAUSED/
   GAME_OVER), `Arena`, `Difficulty`, render/HUD, CLI ve selftest.
+- **assets/**: `ship_p1.png` (P1), `ship_p2.png` (P2) gemi sprite'lari.
+- **tools/aseprite_to_png.py**: `Photos/Sprite-000{1,2}.aseprite` -> `assets/`
+  PNG donusturucu. Aseprite'ta gemiyi duzenleyip kaydettikten sonra
+  `python tools/aseprite_to_png.py` calistir, sprite'lar guncellensin.
 
 Oyun cekirdegi dis dunyaya yalnizca `InputState` uzerinden bakar; klavye veya
 ESP-seri kaynak degistiginde cekirdek **degismez**.
@@ -215,11 +244,12 @@ python main.py --serial        # veya settings.py: INPUT_SOURCE = "serial"
 
 ### 4) Kalibrasyon / ince ayar (settings.py)
 
-- **Eksen ters donuyorsa**: `JOY_INVERT_X` / `JOY_INVERT_Y` degerlerini degistir
-  (arac yukari ittiginde asagi gidiyorsa `JOY_INVERT_Y = True`).
+- **Eksen ters donuyorsa**: ilgili oyuncunun `P1_INVERT_X/Y` veya `P2_INVERT_X/Y`
+  degerini degistir. Iki joystick farkli yonde monte edilebilir; ayar OYUNCU
+  BASINA ayridir (orn. P2 dogruyken P1 ters gelebilir).
 - **Merkezde kayma/titreme**: `ADC_DEADZONE`'u buyut (orn. 0.12).
-- **Buton ters calisiyorsa** (basinca ates kesiliyorsa): firmware'de `b1/b2`
-  satirindaki `LOW` <-> `HIGH` mantigini cevir.
+- **Buton ters calisiyorsa** (basili degilken ozel guc tetikleniyor / basinca
+  tetiklenmiyor): firmware'de `b1/b2` satirindaki `HIGH` <-> `LOW` mantigini cevir.
 
 > Not: `pyserial` opsiyoneldir (`import serial` lazy, sinif icinde). Kurulu
 > olmasa veya port acilamasa bile oyun **cokmez**; uyari basip notr girisle
@@ -229,7 +259,7 @@ python main.py --serial        # veya settings.py: INPUT_SOURCE = "serial"
 
 ## Ayarlar (ozellestirme)
 
-Tum dengeleme degerleri `settings.py` icinde merkezidir: hizlar, can sayisi,
+Tum dengeleme degerleri `settings.py` icinde merkezidir: hizlar, baslangic cani (HP),
 ates cooldown, zorluk tavanlari, meteor boyut/puan esikleri, partikul sayisi,
 seri port/baud/ADC degerleri, yildiz sayisi vb. Oyunu degistirmek icin
 yalnizca bu dosyayi duzenlemek yeterlidir.

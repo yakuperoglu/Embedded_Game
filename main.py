@@ -12,8 +12,9 @@ Giris kaynagi (klavye/seri) calistirma aninda secilir: --serial bayragi
 veya settings.INPUT_SOURCE sabiti ("keyboard"|"serial"). Kod govdesini
 duzenlemeye gerek yoktur (CLI bayragi sabiti gecersiz kilar).
 
-2 oyunculu split-screen uzay atari oyunu. Tum cizim pygame.draw
-primitifleriyle yapilir (disaridan asset YOK).
+2 oyunculu split-screen uzay atari oyunu. Gemiler assets/ sprite'lariyla
+(yoksa ucgen fallback), meteor/mermi/rakip/efektler pygame.draw
+primitifleriyle cizilir.
 """
 
 from __future__ import annotations
@@ -34,9 +35,9 @@ if "--selftest" in sys.argv:
 import pygame
 
 import settings
-from entities import Ship, Bullet, Meteor, spawn_explosion
+from entities import (Ship, Bullet, Meteor, Enemy, EnemyLaser,
+                      spawn_explosion, get_ship_image)
 from input_source import (
-    InputState,
     KeyboardInputSource,
     ScriptedInputSource,
     SerialJoystickInputSource,
@@ -108,9 +109,11 @@ class Arena:
         self.bullets = []
         self.meteors = []
         self.particles = []
+        self.enemies = []           # rakip gemiler
+        self.enemy_lasers = []      # rakip lazerleri
 
         self.score = 0
-        self.lives = settings.START_LIVES
+        self.health = settings.START_HEALTH   # can 0-100 (HP sistemi)
         self.alive = True
 
         self._spawn_timer = 0.0
@@ -120,11 +123,13 @@ class Arena:
         self.special_ready = False    # doldu mu (kullanilabilir mi)
         self._prev_fire = False       # buton rising-edge tespiti icin
         self._flash_timer = 0.0       # ozel guc kullaninca arena flashi (sn)
+        self._hurt_timer = 0.0        # can kaybinda anlik kirmizi flash (sn)
 
     def _make_ship(self) -> Ship:
         x = self.rect.centerx
         y = self.rect.bottom - settings.scaled(settings.SHIP_MARGIN)
-        return Ship(self.rect, self.ship_color, x, y)
+        return Ship(self.rect, self.ship_color, x, y,
+                    image=get_ship_image(self.player_id))
 
     def rescale(self, new_rect: pygame.Rect) -> None:
         """Pencere/tam ekran gecisinde konumlari orana gore tasi (reset DEGIL)."""
@@ -162,6 +167,18 @@ class Arena:
             p.y = remap_y(p.y)
             p.vx *= sy
             p.vy *= sy
+        for e in self.enemies:
+            e.x = remap_x(e.x)
+            e.y = remap_y(e.y)
+            e.arena_rect = new_rect
+            e.size *= sy
+            e.vx *= sy
+        for laser in self.enemy_lasers:
+            laser.x = remap_x(laser.x)
+            laser.y = remap_y(laser.y)
+            laser.vx *= sy
+            laser.vy *= sy
+            laser.r = max(2, int(laser.r * sy))
         self.rect = new_rect
 
     def spawn_meteor(self, difficulty: Difficulty) -> None:
@@ -216,6 +233,21 @@ class Arena:
             self.spawn_meteor(difficulty)
             self._spawn_timer = difficulty.spawn_interval
 
+        # --- Rakip gemiler: devriye + periyodik lazer ---
+        # Lazer, atildigi ANDAKI gemi konumuna dogru gider (takip etmez).
+        for e in self.enemies:
+            e.update(dt)
+            if e.want_fire(dt):
+                mx, my = e.muzzle
+                self.enemy_lasers.append(
+                    EnemyLaser(mx, my, self.ship.x, self.ship.y))
+
+        # --- Rakip lazerleri: hareket + ekran disi temizligi ---
+        for laser in self.enemy_lasers:
+            laser.update(dt)
+        self.enemy_lasers = [laser for laser in self.enemy_lasers
+                             if not laser.is_offscreen(self.rect)]
+
         # --- Partikuller ---
         for p in self.particles:
             p.update(dt)
@@ -223,13 +255,16 @@ class Arena:
 
         # --- Carpisma cozumu (bu arenanin kendi listeleri arasinda) ---
         self._resolve_collisions()
+        self._resolve_enemy_collisions()
 
         # --- Dibe ulasan meteorlar (can kaybi) ---
         self._handle_ground_hits()
 
-        # --- Ozel guc flash zamanlayici ---
+        # --- Efekt zamanlayicilari (ozel guc flashi + hasar flashi) ---
         if self._flash_timer > 0.0:
             self._flash_timer -= dt
+        if self._hurt_timer > 0.0:
+            self._hurt_timer -= dt
 
     def force_spawn(self, difficulty: Difficulty) -> None:
         """Selftest icin meteor dogusunu zorlamak (timer beklemeden)."""
@@ -269,8 +304,7 @@ class Arena:
                 if srect.colliderect(m.rect):
                     dead_meteors.add(mi)
                     self.particles.extend(spawn_explosion(m.x, m.y))
-                    if self.ship.hit():
-                        self._lose_life()
+                    self._take_damage(m.damage)   # boyuta gore hasar
 
         # --- Tek noktada temizlik ---
         if dead_bullets:
@@ -281,35 +315,44 @@ class Arena:
                             if i not in dead_meteors]
 
     def _handle_ground_hits(self) -> None:
-        """Arena dibine ulasan meteorlar: can kaybi + kaldir.
+        """Arena dibine ulasan meteorlar: BOYUTA gore hasar + kaldir.
 
-        ONEMLI: Dibe ulasma (savunmayi gecme) MUTLAK cezadir; dokunulmazlik
-        bunu engellemez (aksi halde 1.6 sn dokunulmazken yagan tum meteorlar
-        bedavaya silinir, somurulebilir denge sorunu). Yine de bir karede
-        meteor kalabaligi tum canlari birden goturmesin diye en fazla 1 can
-        kaybi uygulanir; ilk dibe varan dokunulmazligi yenileyerek geri kalan
-        ayni-kare meteorlarini absorbe eder.
+        Hasar Arena._take_damage uzerinden gider: kisa i-frame penceresinde
+        (INVULN_TIME) ek hasar engellenir, boylece ayni anda dibe varan meteor
+        kalabaligi tum cani birden goturmez. Meteor her durumda kaldirilir.
         """
         survivors = []
-        life_lost_this_frame = False
         for m in self.meteors:
             if m.is_offscreen(self.rect):
-                # Dibe ulasti -> patlama + (kareye ozel) mutlak can kaybi.
                 self.particles.extend(spawn_explosion(m.x, self.rect.bottom - 10))
-                if self.alive and not life_lost_this_frame:
-                    self.ship.force_hit()   # dokunulmazlik YOK SAYILIR
-                    self._lose_life()
-                    life_lost_this_frame = True
-                # meteor her durumda kaldirilir
+                if self.alive:
+                    self._take_damage(m.damage)
             else:
                 survivors.append(m)
         self.meteors = survivors
 
-    def _lose_life(self) -> None:
-        self.lives -= 1
-        if self.lives <= 0:
-            self.lives = 0
+    def _take_damage(self, amount: int) -> None:
+        """Cana 'amount' kadar hasar uygula.
+
+        Gemi i-frame penceresindeyse (yakinda vuruldu) hasar UYGULANMAZ; aksi
+        halde can azalir, kisa i-frame + yanip sonme baslar ve anlik kirmizi
+        flash tetiklenir. Her carpan nesne temaste tuketildigi icin i-frame
+        ust uste carpismalarda 'melt'i (saniyede defalarca hasar) onler.
+        Can 0'a inerse arena elenir.
+        """
+        if self.ship.invulnerable:
+            return
+        self.health -= amount
+        self.ship.start_invuln()
+        self._hurt_timer = settings.HURT_FLASH_TIME   # anlik kirmizi flash
+        if self.health <= 0:
+            self.health = 0
             self.alive = False
+            # Arena oldu: donmus rakipler/lazerler 'ELENDI' overlayi altinda
+            # havada asili kalmasin (update_dead bunlari islemez). Temizle ki
+            # geriye yalnizca sonen partikuller kalsin.
+            self.enemies = []
+            self.enemy_lasers = []
 
     def _add_special_charge(self) -> None:
         """Mermiyle asteroid vuruldukca ozel guc dolar (tavan = gerekli sayi)."""
@@ -321,15 +364,94 @@ class Arena:
             self.special_ready = True
 
     def _activate_special(self) -> None:
-        """Ozel guc: bu arenadaki TUM meteorlari yok et (puan + patlama),
-        sayaci sifirla, kisa arena flashi baslat."""
+        """Ozel guc: bu arenadaki TUM tehditleri temizle (meteorlar + rakip
+        gemiler + rakip lazerleri) + patlama, sayaci sifirla, flash.
+
+        PUAN VERILMEZ: ozel guc bir 'kurtarma/temizleme' aracidir, skor
+        kaynagi DEGIL. Aksi halde oyuncu beceriyle vurmak yerine ozel gucle
+        topluca temizleyip bedava puan (ozellikle ENEMY_SCORE) farm'layabilirdi.
+        """
         for m in self.meteors:
-            self.score += m.points
             self.particles.extend(spawn_explosion(m.x, m.y))
+        for e in self.enemies:
+            self.particles.extend(spawn_explosion(e.x, e.y))
         self.meteors = []
+        self.enemies = []
+        self.enemy_lasers = []
         self.special_charge = 0
         self.special_ready = False
         self._flash_timer = settings.SPECIAL_FLASH_TIME
+
+    def spawn_enemy(self) -> None:
+        """Arenanin ust bandinda, rastgele x'te bir rakip gemi dogur.
+        Arena basina ENEMY_MAX_PER_ARENA siniri asilirsa dogurmaz."""
+        if len(self.enemies) >= settings.ENEMY_MAX_PER_ARENA:
+            return
+        margin = settings.scaled(settings.ENEMY_SIZE)
+        left = self.rect.left + margin
+        right = self.rect.right - margin
+        x = random.uniform(left, right) if right > left else self.rect.centerx
+        band_top = self.rect.top + self.rect.height * settings.ENEMY_BAND_TOP
+        band_bot = self.rect.top + self.rect.height * settings.ENEMY_BAND_BOTTOM
+        y = random.uniform(band_top, band_bot)
+        self.enemies.append(Enemy(self.rect, x, y))
+
+    def _resolve_enemy_collisions(self) -> None:
+        """Mermi vs rakip gemi, rakip lazeri vs oyuncu, rakip govde vs oyuncu.
+        Iterasyon sirasinda liste degistirmeden (olu setleri toplayip filtrele)."""
+        # --- Oyuncu mermisi vs rakip gemi ---
+        dead_bullets = set()
+        dead_enemies = []
+        for bi, b in enumerate(self.bullets):
+            if bi in dead_bullets:
+                continue
+            brect = b.rect
+            for e in self.enemies:
+                if e in dead_enemies:
+                    continue
+                if brect.colliderect(e.rect):
+                    dead_bullets.add(bi)
+                    if e.hit():                       # HP bitti -> yok ol
+                        dead_enemies.append(e)
+                        self.score += settings.ENEMY_SCORE
+                        self.particles.extend(spawn_explosion(e.x, e.y))
+                        self._add_special_charge()
+                    else:                             # sadece hasar (kucuk kivilcim)
+                        self.particles.extend(spawn_explosion(b.x, b.y))
+                    break  # bu mermi tukendi
+        if dead_bullets:
+            self.bullets = [b for i, b in enumerate(self.bullets)
+                            if i not in dead_bullets]
+        if dead_enemies:
+            self.enemies = [e for e in self.enemies if e not in dead_enemies]
+
+        # --- Rakip lazeri vs oyuncu gemisi (carparsa can gider) ---
+        if self.alive:
+            srect = self.ship.rect
+            survivors = []
+            for laser in self.enemy_lasers:
+                if srect.colliderect(laser.rect):
+                    self.particles.extend(spawn_explosion(laser.x, laser.y))
+                    self._take_damage(settings.LASER_DAMAGE)   # sabit hasar
+                    # lazer tuketildi -> survivors'a eklenmez
+                else:
+                    survivors.append(laser)
+            self.enemy_lasers = survivors
+
+        # --- Rakip govde vs oyuncu gemisi (oyuncu yukari cikarsa) ---
+        # Rakibi yalnizca carpisma GERCEKTEN can goturduyse yok et. Dokunulmaz
+        # iken (meteor/lazerden kalan pencere) rakibi yerinde birak; aksi halde
+        # oyuncu cezasiz/puansiz toslamayla tehdidi bedavaya silebilirdi.
+        # Carpisma bir sonraki dokunulmazlik bitiminde cozulur.
+        if self.alive:
+            srect = self.ship.rect
+            crashed = [e for e in self.enemies if srect.colliderect(e.rect)]
+            # Dokunulmazken rakibi bedava silme; carpisma i-frame bitince cozulur.
+            if crashed and not self.ship.invulnerable:
+                self._take_damage(settings.ENEMY_CRASH_DAMAGE)
+                for e in crashed:
+                    self.particles.extend(spawn_explosion(e.x, e.y))
+                self.enemies = [e for e in self.enemies if e not in crashed]
 
     def update_dead(self, dt: float) -> None:
         """Olu arena: gemi/meteor durur ama partikuller sonene kadar isler."""
@@ -343,6 +465,10 @@ class Arena:
         """Arena cizimi (clip aktifken cagrilmali)."""
         for m in self.meteors:
             m.draw(surf)
+        for e in self.enemies:
+            e.draw(surf)
+        for laser in self.enemy_lasers:
+            laser.draw(surf)
         for b in self.bullets:
             b.draw(surf)
         if self.alive:
@@ -382,6 +508,8 @@ class Game:
         self.stars = self._generate_stars()
 
         self.difficulty = Difficulty()
+        self._enemy_timer = random.uniform(settings.ENEMY_SPAWN_MIN,
+                                           settings.ENEMY_SPAWN_MAX)
         self.arena_left = None
         self.arena_right = None
         self._build_arenas()
@@ -418,6 +546,8 @@ class Game:
     def reset(self) -> None:
         """Oyunu bastan baslat: arenalar, skor, can, zorluk sifirlanir."""
         self.difficulty = Difficulty()
+        self._enemy_timer = random.uniform(settings.ENEMY_SPAWN_MIN,
+                                           settings.ENEMY_SPAWN_MAX)
         self._build_arenas()
         self.state = GameStateEnum.PLAYING
 
@@ -496,10 +626,9 @@ class Game:
         """Tam ekran/pencere gecisi. W/H ve TUM konumlar yeniden olceklenir."""
         self.fullscreen = not self.fullscreen
         if self.fullscreen:
-            info = pygame.display.Info()
-            new_w, new_h = info.current_w, info.current_h
-            self.screen = pygame.display.set_mode((new_w, new_h),
-                                                   pygame.FULLSCREEN)
+            # (0,0) -> masaustu cozunurlugu; ekrani TAM kaplar (bosluk olmaz).
+            self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+            new_w, new_h = self.screen.get_size()
         else:
             # Pencere modu: makul bir cozunurluk
             new_w, new_h = 1280, 720
@@ -531,6 +660,16 @@ class Game:
         if self.arena_left.alive or self.arena_right.alive:
             self.difficulty.update(dt)
 
+            # Rakip gemi dogusu: GLOBAL timer, iki arenaya AYNI ANDA (adil), nadir.
+            self._enemy_timer -= dt
+            if self._enemy_timer <= 0.0:
+                if self.arena_left.alive:
+                    self.arena_left.spawn_enemy()
+                if self.arena_right.alive:
+                    self.arena_right.spawn_enemy()
+                self._enemy_timer = random.uniform(settings.ENEMY_SPAWN_MIN,
+                                                    settings.ENEMY_SPAWN_MAX)
+
         # Sol arena
         if self.arena_left.alive:
             self.arena_left.update(dt, inputs[1], self.difficulty)
@@ -554,7 +693,8 @@ class Game:
         # 1) Arka plan + yildizlar
         screen.fill(settings.SPACE_BG)
         for (x, y, b, size) in self.stars:
-            screen.fill((b, b, min(255, b + 30)), (x, y, size, size))
+            screen.fill((b, b, min(255, b + settings.STAR_BLUE_BOOST)),
+                        (x, y, size, size))
 
         # 2) Arenalar (her biri kendi rect'ine kirpili cizilir)
         self._draw_arena(screen, self.arena_left)
@@ -580,18 +720,35 @@ class Game:
         arena.draw(screen)
         # Ozel guc flashi (kullanildiginda kisa beyaz parlama, sonerek)
         if arena._flash_timer > 0.0:
-            a = int(170 * min(1.0, arena._flash_timer / settings.SPECIAL_FLASH_TIME))
+            a = int(settings.SPECIAL_FLASH_ALPHA *
+                    min(1.0, arena._flash_timer / settings.SPECIAL_FLASH_TIME))
             flash = pygame.Surface((arena.rect.width, arena.rect.height),
                                    pygame.SRCALPHA)
             flash.fill((255, 255, 255, a))
             screen.blit(flash, arena.rect.topleft)
+        # Hasar efekti: KALICI kirmizi (can azaldikca artar) + ANLIK flash (vurusta).
+        # Ikisi toplanir: dusuk canda zaten kirmizi taban, vurus aninda parlama spike'i.
+        if arena.alive:
+            danger = (settings.START_HEALTH - arena.health) / max(1, settings.START_HEALTH)
+            persist_a = int(danger * settings.HURT_PERSIST_MAX_ALPHA)
+            flash_a = 0
+            if arena._hurt_timer > 0.0:
+                flash_a = int(settings.HURT_FLASH_ALPHA *
+                              min(1.0, arena._hurt_timer / settings.HURT_FLASH_TIME))
+            hurt_a = min(255, persist_a + flash_a)
+            if hurt_a > 0:
+                red = pygame.Surface((arena.rect.width, arena.rect.height),
+                                     pygame.SRCALPHA)
+                red.fill((settings.HURT_COLOR[0], settings.HURT_COLOR[1],
+                          settings.HURT_COLOR[2], hurt_a))
+                screen.blit(red, arena.rect.topleft)
         # Olu arena -> karartma overlay
         if not arena.alive:
             overlay = pygame.Surface((arena.rect.width, arena.rect.height),
                                      pygame.SRCALPHA)
             overlay.fill(settings.DEAD_OVERLAY)
             screen.blit(overlay, arena.rect.topleft)
-            txt = self.font_med.render("ELENDI", True, (255, 120, 120))
+            txt = self.font_med.render("ELENDI", True, settings.DEAD_TEXT_COLOR)
             tr = txt.get_rect(center=arena.rect.center)
             screen.blit(txt, tr)
         screen.set_clip(None)  # MUTLAKA kapat (HUD/overlay kirpilmasin)
@@ -604,17 +761,17 @@ class Game:
         # --- P1 sol ust ---
         self._blit_text(screen, f"P1  SKOR: {p1.score}", (m, m),
                         settings.HUD_ACCENT)
-        self._blit_text(screen, f"CAN: {self._lives_str(p1.lives)}", (m, m + lh),
-                        settings.HUD_COLOR)
+        self._blit_text(screen, f"CAN: {p1.health}", (m, m + lh),
+                        self._health_color(p1.health))
         self._draw_special(screen, p1, m + 2 * lh, right=False)
 
         # --- P2 sag ust (saga hizali) ---
         def rx(text):
             return self.W - self.font_small.size(text)[0] - m
         s2 = f"P2  SKOR: {p2.score}"
-        c2 = f"CAN: {self._lives_str(p2.lives)}"
+        c2 = f"CAN: {p2.health}"
         self._blit_text(screen, s2, (rx(s2), m), settings.HUD_ACCENT)
-        self._blit_text(screen, c2, (rx(c2), m + lh), settings.HUD_COLOR)
+        self._blit_text(screen, c2, (rx(c2), m + lh), self._health_color(p2.health))
         self._draw_special(screen, p2, m + 2 * lh, right=True)
 
         # --- Ortada zorluk seviyesi gostergesi ---
@@ -642,19 +799,25 @@ class Game:
         self._blit_text(screen, label, (x, y), col)
 
         # Ilerleme cubugu (yazinin altinda)
-        bw = int(settings.scaled(160))
-        bh = max(4, int(settings.scaled(10)))
+        bw = int(settings.scaled(settings.SPECIAL_BAR_W))
+        bh = max(4, int(settings.scaled(settings.SPECIAL_BAR_H)))
         bx = (self.W - bw - m) if right else m
         by = y + self.font_small.get_linesize()
-        pygame.draw.rect(screen, (50, 50, 70), (bx, by, bw, bh), border_radius=3)
+        pygame.draw.rect(screen, settings.SPECIAL_BAR_BG, (bx, by, bw, bh),
+                         border_radius=3)
         if frac > 0:
             pygame.draw.rect(screen, col, (bx, by, int(bw * frac), bh),
                              border_radius=3)
 
     @staticmethod
-    def _lives_str(lives: int) -> str:
-        # Canlari kalp benzeri sembolle goster (ascii guvenli).
-        return ("<3 " * lives).strip() if lives > 0 else "-"
+    def _health_color(hp: int):
+        """Cana gore HUD rengi: yuksek=yesil, orta=sari, dusuk=kirmizi."""
+        frac = max(0.0, hp / settings.START_HEALTH)
+        if frac > settings.HP_WARN_FRAC:
+            return settings.HUD_HP_GOOD
+        if frac > settings.HP_LOW_FRAC:
+            return settings.HUD_HP_WARN
+        return settings.HUD_HP_LOW
 
     def _blit_text(self, screen, text, pos, color, font=None) -> None:
         font = font or self.font_small
@@ -676,7 +839,7 @@ class Game:
         screen.blit(overlay, (0, 0))
 
         self._center_text(screen, "OYUN BITTI", self.font_big,
-                          (255, 90, 90), dy=-110)
+                          settings.HUD_HP_LOW, dy=-110)
 
         winner = self._winner()
         self._center_text(screen, winner, self.font_med,
@@ -711,6 +874,56 @@ class Game:
 
 
 # =====================================================================
+# Selftest: rakip-spesifik carpisma yollarini deterministik dogrula
+# =====================================================================
+def _selftest_enemy_paths(game: "Game") -> None:
+    """Rakip carpisma mantigini GARANTILI (rastgele scripted girise bagli
+    olmadan) calistirir ve sonuclari assert eder:
+      (1) Mermi rakibe ENEMY_HP kez isabet edince rakip yok olur, listeden
+          cikar ve skor ENEMY_SCORE artar (mermi->rakip->skor yolu).
+      (2) Bir EnemyLaser dogrudan gemi uzerine konup (ship.invuln_timer=0)
+          bir kare cozuldugunde oyuncu LASER_DAMAGE kadar HP kaybeder
+          (lazer->can yolu).
+    Yan etki birakmamak icin temiz bir arena uzerinde calisir."""
+    arena = game.arena_left
+
+    # --- (1) Mermi vs rakip: ENEMY_HP isabet -> yok + ENEMY_SCORE ---
+    arena.bullets = []
+    arena.enemies = []
+    arena.enemy_lasers = []
+    arena.meteors = []
+    e = Enemy(arena.rect, arena.ship.x, arena.rect.top + 30)
+    arena.enemies.append(e)
+    score_before = arena.score
+    enemies_before = len(arena.enemies)
+    # ENEMY_HP kadar mermi: her birini rakip uzerine koyup carpismayi coz.
+    for _ in range(settings.ENEMY_HP):
+        b = Bullet(e.x, e.y)
+        b.y = e.y                      # tam ust uste -> kesin carpisir
+        arena.bullets.append(b)
+        arena._resolve_enemy_collisions()
+    assert len(arena.enemies) == enemies_before - 1, \
+        "Rakip ENEMY_HP isabette yok olmadi"
+    assert arena.score == score_before + settings.ENEMY_SCORE, \
+        "Rakip yok edilince ENEMY_SCORE eklenmedi"
+
+    # --- (2) Lazer vs gemi: dokunulmaz degilken LASER_DAMAGE kadar HP kaybi ---
+    arena.bullets = []
+    arena.enemies = []
+    arena.meteors = []
+    arena.enemy_lasers = []
+    arena.ship.invuln_timer = 0.0      # dokunulmaz degil
+    health_before = arena.health
+    laser = EnemyLaser(arena.ship.x, arena.ship.y, arena.ship.x, arena.ship.y)
+    laser.x, laser.y = arena.ship.x, arena.ship.y   # tam gemi uzerinde
+    arena.enemy_lasers.append(laser)
+    arena._resolve_enemy_collisions()
+    assert arena.health == health_before - settings.LASER_DAMAGE, \
+        "Rakip lazeri gemiye carpinca can LASER_DAMAGE kadar azalmadi"
+    assert len(arena.enemy_lasers) == 0, "Carpan lazer tuketilmedi"
+
+
+# =====================================================================
 # Selftest harness (headless dogrulama)
 # =====================================================================
 def run_selftest() -> None:
@@ -738,6 +951,11 @@ def run_selftest() -> None:
             arena.meteors.append(m)
             # Mermi de ekle ki mermi-meteor carpismasi da denensin.
             arena.bullets.append(Bullet(arena.ship.x, arena.ship.y - 30))
+            # Rakip gemi + lazer yollarini da test et (update/carpisma/cizim).
+            arena.spawn_enemy()
+            arena.enemy_lasers.append(
+                EnemyLaser(arena.ship.x, arena.ship.y - 80,
+                           arena.ship.x, arena.ship.y))
 
         dt = settings.SELFTEST_DT
         collisions_seen = False
@@ -765,6 +983,12 @@ def run_selftest() -> None:
         produced_particles = (len(game.arena_left.particles) >= 0)
         assert produced_particles, "Partikul listesi gecersiz"
 
+        # -------------------------------------------------------------
+        # RAKIP CARPISMA YOLLARINI DETERMINISTIK ZORLA (yesil yaniltici
+        # olmasin): mermi->rakip->yok edilme->ENEMY_SCORE ve lazer->can kaybi.
+        # -------------------------------------------------------------
+        _selftest_enemy_paths(game)
+
         print("[selftest] OK - frames=%d, elapsed=%.2fs, P1=%d P2=%d, "
               "collisions_seen=%s"
               % (settings.SELFTEST_FRAMES, game.difficulty.elapsed,
@@ -787,16 +1011,35 @@ def run_selftest() -> None:
 # =====================================================================
 # Giris noktasi
 # =====================================================================
+def _enable_windows_dpi_awareness() -> None:
+    """Windows'ta sureci DPI-aware yapar ki tam ekran FIZIKSEL cozunurlukte
+    acilsin. Ekran olcekleme (orn. %125/%150) acikken bu yapilmazsa pencere
+    daha kucuk mantiksal cozunurlukte acilir ve sag/alt tarafta siyah bosluk
+    kalir. Diger platformlarda etkisizdir."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)   # Per-Monitor v2
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()         # eski API (fallback)
+    except Exception:
+        pass   # DPI ayari yapilamasa bile oyun calismaya devam etsin
+
+
 def main() -> None:
     if "--selftest" in sys.argv:
         run_selftest()
         return
 
+    _enable_windows_dpi_awareness()   # tam ekran fiziksel cozunurlukte acilsin
     pygame.init()
-    # Tam ekran: cozunurlugu monitorden al (sabit pixel hardcode YOK).
-    info = pygame.display.Info()
-    w, h = info.current_w, info.current_h
-    screen = pygame.display.set_mode((w, h), pygame.FULLSCREEN)
+    # Tam ekran: SDL'e (0,0) verince MEVCUT MASAUSTU cozunurlugu kullanilir,
+    # boylece ekran TAM kaplanir (sag/alt bosluk olmaz). Gercek boyutu
+    # surface'ten okuruz; her sey SCALE = H/1080 ile bu cozunurluge uyarlanir.
+    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+    w, h = screen.get_size()
     pygame.display.set_caption("Split-Screen Uzay Atari")
 
     # Giris kaynagi secimi (calistirma aninda; kod govdesi duzenlenmez).
